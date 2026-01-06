@@ -65,6 +65,30 @@ class AsyncMCPApp(MCPApp):
 
         logger.info(f"Starting {self._name} v{self.version} with {len(self._catalog)} tools")
 
+        # Monkey-patch HTTPStreamableTransport to be permissive
+        from arcade_mcp_server.transports.http_streamable import HTTPStreamableTransport
+        from starlette.requests import Request
+        from starlette.types import Send
+        
+        # Patch headers check
+        def permissive_check_headers(self, request):
+            return True, True
+        HTTPStreamableTransport._check_accept_headers = permissive_check_headers
+
+        # Patch session validation to allow initial GET connection without session ID
+        original_validate_session = HTTPStreamableTransport._validate_session
+        async def permissive_validate_session(self, request: Request, send: Send) -> bool:
+            if request.method == "GET":
+                return True
+            return await original_validate_session(self, request, send)
+        HTTPStreamableTransport._validate_session = permissive_validate_session
+        
+        # Patch middleware to disable slash adding which confuses routing for new endpoints
+        from arcade_mcp_server.fastapi.middleware import AddTrailingSlashToPathMiddleware
+        async def noop_dispatch(self, request, call_next):
+             return await call_next(request)
+        AddTrailingSlashToPathMiddleware.dispatch = noop_dispatch
+
         if transport in ["http", "streamable-http", "streamable"]:
             if reload:
                 # Reloading is typically synchronous/blocking for the watcher
@@ -75,6 +99,8 @@ class AsyncMCPApp(MCPApp):
                 
                 from arcade_mcp_server.worker import create_arcade_mcp, serve_with_force_quit
                 from arcade_mcp_server.usage import ServerTracker
+                from starlette.responses import Response
+                from starlette.types import Scope, Receive, Send
 
                 app_instance = create_arcade_mcp(
                     catalog=self._catalog,
@@ -82,6 +108,35 @@ class AsyncMCPApp(MCPApp):
                     debug=debug,
                     **self.server_kwargs,
                 )
+
+                # Define a proxy class
+                class MCPASGIProxy:
+                    def __init__(self, parent_app):
+                        self._app = parent_app
+
+                    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                        session_manager = getattr(self._app.state, "session_manager", None)
+                        if session_manager is None:
+                            resp = Response("MCP server not initialized", status_code=503)
+                            await resp(scope, receive, send)
+                            return
+                        await session_manager.handle_request(scope, receive, send)
+
+                # Mount the proxy at /sse and /messages
+                proxy = MCPASGIProxy(app_instance)
+                
+                # Use mount which matches path prefixes and is robust
+                app_instance.mount("/sse", proxy)
+                app_instance.mount("/messages", proxy)
+                
+                # Add root route for health checks
+                @app_instance.get("/")
+                async def root():
+                    return {"status": "ok", "service": "azure-devops-mcp"}
+
+                # print(f"App instance type: {type(app_instance)}")
+                # for route in app_instance.routes:
+                #     print(f"Registered route: {route.path}")
 
                 tracker = ServerTracker()
                 tracker.track_server_start(
