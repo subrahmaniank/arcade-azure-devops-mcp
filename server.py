@@ -30,8 +30,96 @@ from arcade_mcp_server import MCPApp, Context
 from arcade_azure_devops_mcp.client import AzureDevOpsClient, AzureDevOpsClientError
 from arcade_azure_devops_mcp.auth.manager import AuthManager
 
+
+class AsyncMCPApp(MCPApp):
+    """MCPApp subclass with run_async support for FastMCP compatibility."""
+
+    async def run_async(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        reload: bool = False,
+        transport: str = "stdio",
+        **kwargs: Any,
+    ) -> None:
+        """Run the server asynchronously."""
+        if len(self._catalog) == 0:
+            import sys
+            from loguru import logger
+            logger.error("No tools added to the server. Use @app.tool decorator or app.add_tool().")
+            sys.exit(1)
+
+        # Apply configuration overrides (env vars)
+        host, port, transport, reload = self._get_configuration_overrides(
+            host, port, transport, reload
+        )
+
+        self._setup_logging(transport == "stdio")
+
+        import os
+        from loguru import logger
+        from arcade_mcp_server.exceptions import ServerError
+        
+        if os.getenv("ARCADE_MCP_CHILD_PROCESS") == "1":
+            reload = False
+
+        logger.info(f"Starting {self._name} v{self.version} with {len(self._catalog)} tools")
+
+        if transport in ["http", "streamable-http", "streamable"]:
+            if reload:
+                # Reloading is typically synchronous/blocking for the watcher
+                self._run_with_reload(host, port)
+            else:
+                debug = self.log_level == "DEBUG"
+                log_level = "debug" if debug else "info"
+                
+                from arcade_mcp_server.worker import create_arcade_mcp, serve_with_force_quit
+                from arcade_mcp_server.usage import ServerTracker
+
+                app_instance = create_arcade_mcp(
+                    catalog=self._catalog,
+                    mcp_settings=self._mcp_settings,
+                    debug=debug,
+                    **self.server_kwargs,
+                )
+
+                tracker = ServerTracker()
+                tracker.track_server_start(
+                    transport="http",
+                    host=host,
+                    port=port,
+                    tool_count=len(self._catalog),
+                )
+
+                await serve_with_force_quit(
+                    app=app_instance,
+                    host=host,
+                    port=port,
+                    log_level=log_level,
+                )
+                
+        elif transport == "stdio":
+            from arcade_mcp_server.__main__ import run_stdio_server
+            from arcade_mcp_server.usage import ServerTracker
+
+            tracker = ServerTracker()
+            tracker.track_server_start(
+                transport="stdio",
+                host=None,
+                port=None,
+                tool_count=len(self._catalog),
+            )
+            await run_stdio_server(
+                catalog=self._catalog,
+                settings=self._mcp_settings,
+                **self.server_kwargs,
+            )
+        else:
+            raise ServerError(f"Invalid transport: {transport}")
+
+
 # Create the MCP App
-app = MCPApp(name="azure_devops", version="0.1.0", log_level="INFO")
+app = AsyncMCPApp(name="azure_devops", version="0.1.0", log_level="INFO")
 
 # Secrets required for Azure DevOps authentication
 AZURE_SECRETS = ["AZURE_DEVOPS_ORG", "AZURE_DEVOPS_PAT"]
