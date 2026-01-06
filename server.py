@@ -75,12 +75,14 @@ class AsyncMCPApp(MCPApp):
             return True, True
         HTTPStreamableTransport._check_accept_headers = permissive_check_headers
 
-        # Patch session validation to allow initial GET connection without session ID
-        original_validate_session = HTTPStreamableTransport._validate_session
+        # Patch content type check
+        def permissive_check_content_type(self, request):
+            return True
+        HTTPStreamableTransport._check_content_type = permissive_check_content_type
+
+        # Patch session validation to allow ALL requests to proceed without session ID
         async def permissive_validate_session(self, request: Request, send: Send) -> bool:
-            if request.method == "GET":
-                return True
-            return await original_validate_session(self, request, send)
+            return True
         HTTPStreamableTransport._validate_session = permissive_validate_session
         
         # Patch middleware to disable slash adding which confuses routing for new endpoints
@@ -88,6 +90,112 @@ class AsyncMCPApp(MCPApp):
         async def noop_dispatch(self, request, call_next):
              return await call_next(request)
         AddTrailingSlashToPathMiddleware.dispatch = noop_dispatch
+
+        # Patch HTTPSessionManager to handle stale session IDs gracefully
+        from arcade_mcp_server.transports.http_session_manager import HTTPSessionManager
+        from arcade_mcp_server.transports.http_streamable import MCP_SESSION_ID_HEADER
+        from uuid import uuid4
+        from anyio.abc import TaskStatus
+        import anyio
+        from arcade_mcp_server.session import ServerSession
+        from starlette.types import Scope, Receive, Send
+
+        async def permissive_handle_stateful_request(self, scope: Scope, receive: Receive, send: Send) -> None:
+            """Process request in stateful mode - maintain session state.
+            Patched to treat unknown session IDs as new sessions instead of 400s.
+            """
+            request = Request(scope, receive)
+            request_mcp_session_id = request.headers.get(MCP_SESSION_ID_HEADER)
+
+            # Existing session case
+            if request_mcp_session_id and request_mcp_session_id in self._server_instances:
+                transport = self._server_instances[request_mcp_session_id]
+                logger.debug("Session already exists, handling request directly")
+                await transport.handle_request(scope, receive, send)
+                return
+
+            # New session case (ID is None OR ID is unknown/stale)
+            # Original code would return 400 for unknown ID. We proceed to create new.
+            
+            if request_mcp_session_id and request_mcp_session_id not in self._server_instances:
+                logger.warning(f"Client sent unknown session ID {request_mcp_session_id}. Creating new session.")
+                # We don't need to unset the header because we just proceed to create a new transport
+                # and ignore the incoming ID for the purpose of lookup.
+                # However, the Transport itself might check the header against its own ID?
+                # HTTPStreamableTransport._validate_session checks if header matches self.mcp_session_id.
+                # If we create a NEW transport with a NEW ID, but the request still has the OLD ID header,
+                # _validate_session will fail (return 404 or 400).
+                
+                # So we MUST remove the header from the request/scope before passing it to the new transport.
+                # Modifying 'scope' headers is tricky but possible.
+                
+                # Actually, simpler: We patched _validate_session in HTTPStreamableTransport to always return True!
+                # So the mismatch won't matter there.
+                pass
+
+            logger.debug("Creating new transport")
+            async with self._session_creation_lock:
+                new_session_id = uuid4().hex
+                http_transport = HTTPStreamableTransport(
+                    mcp_session_id=new_session_id,
+                    is_json_response_enabled=self.json_response,
+                    event_store=self.event_store,
+                )
+
+                if http_transport.mcp_session_id is None:
+                    raise RuntimeError("MCP session ID not set")
+                self._server_instances[http_transport.mcp_session_id] = http_transport
+                logger.info(f"Created new transport with session ID: {new_session_id}")
+
+                # Define the server runner
+                async def run_server(
+                    *, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED
+                ) -> None:
+                    async with http_transport.connect() as streams:
+                        read_stream, write_stream = streams
+                        task_status.started()
+                        try:
+                            # Create a session for this connection
+                            session = ServerSession(
+                                server=self.server,
+                                read_stream=read_stream,
+                                write_stream=write_stream,
+                                init_options={"transport_type": "http"},
+                            )
+
+                            # Set the session on the transport
+                            http_transport.session = session
+
+                            # Run the session (start + loop until closed)
+                            await session.run()
+
+                            # Brief yield to allow cleanup
+                            await anyio.sleep(0)
+                        except Exception as e:
+                            logger.error(
+                                f"Session {http_transport.mcp_session_id} crashed: {e}",
+                                exc_info=True,
+                            )
+                        finally:
+                            # Clean up on crash
+                            if (
+                                http_transport.mcp_session_id
+                                and http_transport.mcp_session_id in self._server_instances
+                                and not http_transport.is_terminated
+                            ):
+                                logger.info(
+                                    f"Cleaning up crashed session {http_transport.mcp_session_id}"
+                                )
+                                del self._server_instances[http_transport.mcp_session_id]
+
+                if self._task_group is None:
+                    raise RuntimeError("Task group not initialized")
+                await self._task_group.start(run_server)
+
+                # Handle the HTTP request
+                await http_transport.handle_request(scope, receive, send)
+
+        HTTPSessionManager._handle_stateful_request = permissive_handle_stateful_request
 
         if transport in ["http", "streamable-http", "streamable"]:
             if reload:
@@ -633,4 +741,5 @@ if __name__ == "__main__":
     transport = sys.argv[1] if len(sys.argv) > 1 else "stdio"
 
     # Run the server
-    app.run(transport=transport, host="127.0.0.1", port=8000)
+    import asyncio
+    asyncio.run(app.run_async(transport=transport, host="127.0.0.1", port=8000))
